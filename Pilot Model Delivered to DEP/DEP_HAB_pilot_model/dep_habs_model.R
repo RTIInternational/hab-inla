@@ -1,0 +1,538 @@
+##########BEGIN HEADER#######
+#Title: DEP Harmful Algal Blooms Predictive Model
+#Last modified: 6/27/2024 by Ben Lord
+#Contact information: blord@rti.org
+#
+#Objective: Given output dataset from ETL processes, issue prediction of Harmful Algal Bloom (HAB) presence or absecne for freshwater lakes in Florida
+#
+#Further documentation: see accompanying user guide and memos
+##########END HEADER###############
+
+#Install packages if missing
+if("tidyverse" %in% rownames(installed.packages()) == FALSE) {
+  install.packages("tidyverse", repos='http://cran.us.r-project.org')}
+if("rstudioapi" %in% rownames(installed.packages()) == FALSE) {
+  install.packages("rstudioapi", repos='http://cran.us.r-project.org')}
+if("fs" %in% rownames(installed.packages()) == FALSE) {
+  install.packages("fs", repos='http://cran.us.r-project.org')}
+if("janitor" %in% rownames(installed.packages()) == FALSE) {
+  install.packages("janitor", repos='http://cran.us.r-project.org')}
+if("ROCR" %in% rownames(installed.packages()) == FALSE) {
+  install.packages("ROCR", repos='http://cran.us.r-project.org')}
+if("caret" %in% rownames(installed.packages()) == FALSE) {
+  install.packages("caret", repos='http://cran.us.r-project.org')}
+if("sf" %in% rownames(installed.packages()) == FALSE) {
+  install.packages("sf", repos='http://cran.us.r-project.org')}
+if("ggspatial" %in% rownames(installed.packages()) == FALSE) {
+  install.packages("ggspatial", repos='http://cran.us.r-project.org')}
+if("RColorBrewer" %in% rownames(installed.packages()) == FALSE) {
+  install.packages("RColorBrewer", repos='http://cran.us.r-project.org')}
+if("INLA" %in% rownames(installed.packages()) == FALSE) {
+  install.packages("INLA",repos=c(getOption("repos"),INLA="https://inla.r-inla-download.org/R/stable"), dep=TRUE) }
+if("inlabru" %in% rownames(installed.packages()) == FALSE) {
+  install.packages("inlabru", repos='http://cran.us.r-project.org')}
+
+# Clear environment ----
+rm(list = ls())
+
+# Read in packages----
+library(tidyverse)
+library(rstudioapi)
+library(fs)
+library(janitor)
+library(inlabru)
+library(INLA)
+library(ROCR)
+library(caret)
+library(sf)
+library(ggspatial)
+library(RColorBrewer)
+
+# Set seed ----
+set.seed(1234)
+
+# Set workspace ----
+script_path <- rstudioapi::getActiveDocumentContext()$path
+setwd(dirname(script_path))
+
+## File paths and names ----
+
+lakes_fp <- './data/HABS_Prediction_Polygons.shp'
+
+cyan_data_fp <- 'data/stage/cyan_lake_stats_7day.csv'
+
+fl_bound_fp <- './data/FL_Boundary.shp'
+
+static_data_fp <- "./data/HABS_Model_Static_Data.csv"
+
+data_folder <- 'data/stage/'
+
+mrms_files <- dir_ls(data_folder,regexp = "mrms.*csv$")
+
+rtma_files <- dir_ls(data_folder,regexp = "rtma.*csv$")
+
+
+
+# Functions for Model Execution ----
+
+optimize_cutoff <- function(performance, value) {
+  cut_index <- mapply(FUN = function(x, y, p){
+    d <- (x - 0)^2 + (y - 1)^2
+    index <- which(d == min(d))
+    c(sensitivity = y[[index]], # tpr
+      specificity = 1-x[[index]], #tnr
+      cutoff = p[[index]])},
+    # The '@' operator is used to access data in S4 class objects (e.g. the performance instances)
+    performance@x.values, # tpr
+    performance@y.values, # tnr
+    value@cutoffs
+  )
+}
+
+generate_cm <- function(responses, observations,cutoff) {
+  tibble(
+    response = factor(responses >= cutoff[3],
+                      levels = c(T,F), ordered = T),
+    observed = factor(observations, levels = c(1,0),
+                      labels = c(T,F), ordered = T)
+  ) %>% table() %>% return()
+}
+
+generate_stats <- function(responses, observations,cutoff) {
+  cm <- generate_cm(responses = responses, observations = observations,cutoff = cutoff)
+  
+  roc_instance <- prediction(responses,observations)
+  
+  auc <- performance(roc_instance, measure = 'auc')
+  
+  stats <- confusionMatrix(cm)
+  
+  tibble(
+    AUC = auc@y.values[[1]],
+    Sensitivity = stats$byClass[1],
+    Specificity = stats$byClass[2],
+    Accuracy = stats$overall[1],
+    Precision = cm[1,1]/(cm[1,1] + cm[1,2]),
+    Prevalence = (cm[1,1] + cm[2,1])/sum(cm),
+    `False Omission Rate` = cm[2,1]/(cm[2,1] + cm[2,2]),
+    `F1 Score` = (2*cm[1,1])/(2*cm[1,1] + cm[1,2] + cm[2,1]),
+    Kappa = stats$overall[2],
+    `Brier Score` = mean((responses - observations)^2)
+  ) %>% t() %>% return()
+}
+
+calculate_performance_stats <- function(model){
+  
+  fit_i <- get(model)
+  subscript <- str_extract(model, "(?<=_).*") 
+  formula_i <- get(str_c("formula_",subscript))
+  
+  cat(str_c("\nGenerating summary stats for ",model))
+  # cat(str_c("\nModel call: ", str_c(as.character(formula_1)[2]," ~ ", as.character(formula_1)[3])))
+  
+  # Pull predictions if generated
+  if(class(try(get(str_c("predictions_",subscript)), silent = T)) == "try-error") {
+    # cat(str_c("\nPredictions have not been generated for ", subscript,
+    #           ";\nSummary stats will only be generated for training and validation subsets"))
+  } else {
+    predictions_i <- get(str_c("predictions_",subscript))
+  }
+  
+  # Pull responses and save to environment
+  responses_i <- fit_i$summary.fitted.values$mean[1:nrow(cyan_data)]
+  assign(str_c("responses_",subscript), responses_i, envir = parent.frame())
+  
+  training_responses_i <- responses_i[training_subset]
+  assign(str_c("training_responses_",subscript), responses_i)
+  validation_responses_i <- responses_i[validation_subset]
+  assign(str_c("validation_responses_",subscript), responses_i, envir = parent.frame())
+  
+  # Calculate cutoff value
+  validation_roc_instance_i <- prediction(validation_responses_i,validation_observations)
+  assign(str_c("validation_roc_instance_",i),validation_roc_instance_i, envir = parent.frame())
+  validation_roc_performance_instance_i <- performance(validation_roc_instance_i, measure = 'tpr', x.measure = 'fpr')
+  assign(str_c("validation_roc_performance_instance_",i),validation_roc_performance_instance_i, envir = parent.frame())
+  
+  cutoff_i <- optimize_cutoff(validation_roc_performance_instance_i,
+                              validation_roc_instance_i) # Cutoff value is cutoff[3]
+  assign(str_c("cutoff_",subscript),cutoff_i, envir = parent.frame())
+  
+  # Print cutoff value
+  # cat(str_c("\nCutoff value: ",cutoff_i[3]))
+  
+  # Generate performance stats
+  ### TRAINING RESULTS
+  # cat("\nTraining results:\n")
+  train_cm_i <- generate_cm(responses = training_responses_i,observations = training_observations,cutoff_i)
+  # print(train_cm_i); 
+  assign(str_c("train_cm_",subscript),train_cm_i, envir = parent.frame())
+  train_stats_i <- generate_stats(responses = training_responses_i,
+                                  observations = training_observations,cutoff_i)
+  # print(train_stats_i); 
+  assign(str_c("train_stats_",subscript),train_stats_i, envir = parent.frame())
+  
+  ### VALIDATION RESULTS
+  # cat("\nValidation results:\n")
+  val_cm_i <- generate_cm(responses = validation_responses_i,observations = validation_observations,cutoff_i)
+  # print(val_cm_i); 
+  assign(str_c("val_cm_",subscript),val_cm_i, envir = parent.frame())
+  val_stats_i <- generate_stats(responses = validation_responses_i,
+                                observations = validation_observations,cutoff_i)
+  # print(val_stats_i); 
+  assign(str_c("val_stats_",subscript),val_stats_i, envir = parent.frame())
+  
+  ## PREDICTION RESULTS
+  if(try(exists("predictions_i"), silent = T) == F) {
+    cat(str_c("\nFinished processing results for fit_",subscript,"\n"))
+  } else {
+    # cat("\nPrediction results:\n")
+    
+    prediction_responses_i <- predictions_i$mean
+    
+    # Need to remove missing data from prediction observations
+    pred_auc_susbset <- which(!is.na(prediction_observations))
+    
+    pred_cm_i <- generate_cm(responses = prediction_responses_i[pred_auc_susbset],observations = prediction_observations[pred_auc_susbset],cutoff_i)
+    # print(pred_cm_i); 
+    assign(str_c("pred_cm_",i),pred_cm_i, envir = parent.frame())
+    pred_stats_i <- generate_stats(responses = prediction_responses_i[pred_auc_susbset],
+                                   observations = prediction_observations[pred_auc_susbset],cutoff_i)
+    # print(pred_stats_i); 
+    assign(str_c("pred_stats_",i),pred_stats_i, envir = parent.frame())
+    cat(str_c("\nFinished processing results for fit_",subscript,"\n"))
+  }
+  
+  # Combine all stats for function output
+  colnames(train_stats_i) <- 'training'
+  colnames(val_stats_i) <- 'validation'
+  if(try(exists("predictions_i"), silent = T) == T){
+    colnames(pred_stats_i) <- 'prediction'
+    return(list(
+      str_c("Model call for ", model,": ", str_c(as.character(formula_i)[2]," ~ ", as.character(formula_i)[3])),
+      cbind(train_stats_i,val_stats_i,pred_stats_i)
+    ))
+  } else {
+    return(list(
+      str_c("Model call for ", model,": ", str_c(as.character(formula_i)[2]," ~ ", as.character(formula_i)[3])),
+      cbind(train_stats_i,val_stats_i)
+    ))
+  }
+  
+}
+
+generate_export_tibble <- function(model) {
+  
+  fit_i <- get(model)
+  subscript <- str_extract(model, "(?<=_).*") 
+  
+  responses_i <- get(str_c("responses_",subscript))
+  predictions_i <- get(str_c("predictions_",subscript))
+  cutoff_i <- get(str_c("cutoff_",subscript))[3]
+  
+  tibble(
+    id = cyan_data_prepped$id,
+    date = cyan_data_prepped$date,
+    yday = yday(cyan_data_prepped$date),
+    perc_ge_thresh = cyan_data_prepped$perc_ge_thresh,
+    observed_bloom = cyan_data_prepped$bloom,
+    response_prob = c(responses_i[which(cyan_data_prepped$subset != 'prediction')],
+                      predictions_i$mean),
+    response_bloom = ifelse(response_prob >= cutoff_i,1,0),
+    class = factor(ifelse(response_bloom == 0 & observed_bloom == 0, 'TN',
+                          ifelse(response_bloom == 0 & observed_bloom == 1, 'FN',
+                                 ifelse(response_bloom == 1 & observed_bloom == 1, 'TP',
+                                        ifelse(response_bloom == 1 & observed_bloom == 0, 'FP',NA))))), # NA's should equal the number of missing values in input$Bloom_adjusted
+    subset = cyan_data_prepped$subset
+  ) -> export_csv
+  
+  write_csv(export_csv,str_c("export_data_",subscript,".csv"))
+  
+  return(export_csv)
+}
+
+## Import files ----
+
+fl_lz <- read_sf(lakes_fp) %>% clean_names() 
+
+fl_bound <- read_sf(fl_bound_fp) %>% st_transform(st_crs(fl_lz))
+
+cyan_data <- read_csv(cyan_data_fp) %>% clean_names() %>% dplyr::select(-x1)
+
+static_data <- read_csv(static_data_fp) %>% clean_names() 
+
+huc_assignments <- dplyr::select(static_data, id, huc12, huc10, huc8, lake_id)
+
+## Read mrms_files
+# Note: pseudo-forecast missing for last 6 days of dataset
+for(i in 1:length(mrms_files)){
+  print(str_c(i, " of ", length(mrms_files)))
+  
+  mrms_i <- read_csv(mrms_files[i]) %>% clean_names()  %>% dplyr::select(-x1) 
+  
+  # Some files have extra cols we don't need - remove
+  if(ncol(mrms_i > 3)) {mrms_i <- mrms_i[,1:3]}
+  
+  # Scale precip
+  mrms_i %>% mutate(mean_precipitation = scale(mean_precipitation)[,1]) -> mrmrs_i
+  
+  if(str_detect(mrms_files[i],"fcst")) {
+    new_precip_name <- str_extract(mrms_files[i],"precip_[:alnum:]+_[:alnum:]+_fcst") %>% first
+  } else {
+    new_precip_name <- str_extract(mrms_files[i],"precip_[:alnum:]+_[:alnum:]+") %>% first
+  }
+  
+  colnames(mrms_i) <- c(colnames(mrms_i)[1:2],new_precip_name) # renames third col to something specific
+  
+  # Filter out objects that do not contain lakes of interest
+  mrms_i <- huc_assignments %>% left_join(mrms_i)
+  
+  if(i == 1) {
+    mrms_compiled <- mrms_i
+  } else {
+    mrms_compiled <- full_join(mrms_compiled,mrms_i)
+  }
+  
+}
+
+## Read rtma_files
+for(i in 1:length(rtma_files)){
+  print(str_c(i, " of ", length(rtma_files)))
+  
+  rtma_i <- read_csv(rtma_files[i]) %>% clean_names()
+  
+  # Scale variables
+  rtma_i %>%
+    mutate(
+      temperature = scale(temperature)[,1],
+      pressure = scale(pressure)[,1],
+      cloud_cover = scale(cloud_cover)[,1],
+      wind_direction = scale(wind_direction)[,1],
+      wind_speed = scale(wind_speed)[,1]
+    ) -> rtma_i
+  
+  # correct col type for later merging
+  rtma_i[,2] <- as.numeric(first(as.vector(rtma_i[,2])))
+  
+  # rename columns
+  vars <- colnames(rtma_i)[3:7]
+  
+  if(str_detect(rtma_files[i],"fcst")) {
+    new_var_names <- str_c(vars,str_extract(rtma_files[i],"_[^/rtma_wx][:alnum:]+_[:alnum:]+_fcst")[1])
+  } else {
+    new_var_names <- str_c(vars,str_extract(rtma_files[i],"_[^/rtma_wx][:alnum:]+_[:alnum:]+")[1])
+  }
+  
+  colnames(rtma_i) <- c(colnames(rtma_i)[1:2],new_var_names)
+  
+  # Filter out objects that do not contain lakes of interest
+  rtma_i <- huc_assignments %>% left_join(rtma_i)
+  
+  if(i == 1) {
+    rtma_compiled <- rtma_i
+  } else {
+    rtma_compiled <- left_join(rtma_compiled,rtma_i)
+  }
+}
+
+# Build mesh ----
+fl_lz %>% filter(type == 'Zone') %>%
+  pull(lake_id) %>% unique() -> lakes_with_zones # List of lakes that have zones
+
+fl_lz %>% filter(type == "Lake") -> fl_lakes # Lakes only
+
+fl_lz %>% filter(!id %in% as.numeric(str_c(as.character(lakes_with_zones),'000'))) -> fl_zones 
+
+loc <- tibble(
+  lon = st_coordinates(st_centroid(fl_zones))[,1],
+  lat = st_coordinates(st_centroid(fl_zones))[,2]
+)
+
+max_edge <- diff(range(loc[,1]))/3
+
+mesh <- inla.mesh.2d(
+  loc = loc, 
+  boundary = fl_lakes,
+  max.edge = max_edge*c(1,2),
+  offset = max_edge*c(0.75,1),
+  cutoff = 5000,
+  min.angle = 30
+)
+
+# Generate cyclic date ----
+cyan_data %>%
+  mutate(cyclic_date = cyclic_encoding(date,periods = "year", encoders = "cos")[,"cos.year"]) -> cyan_data
+
+# Prep model input data frame ----
+#Prep static data
+static_data %>% 
+  # Remove cols for precip/temp anomaly 
+  dplyr::select(colnames(.)[1:18]) %>%
+  # Scale predictor vars
+  mutate(
+    wtr_pixl_cnt = scale(wtr_pixl_cnt)[,1],
+    wtr_area_km2 = scale(wtr_area_km2)[,1],
+    total_area_km2 = scale(total_area_km2)[,1],
+    depth_hyd_m = scale(depth_hyd_m)[,1],
+    max_fetch_m = scale(max_fetch_m)[,1],
+    geo_mean_color = scale(geo_mean_color)[,1],
+    geo_mean_alk = scale(geo_mean_alk)[,1],
+    avg_precip_annual = scale(avg_precip_annual)[,1],
+    avg_temp_annual = scale(avg_temp_annual)[,1]
+  ) -> static_data_prepped
+
+# max_date <- max(cyan_data$date)
+max_date <- ymd("2024-04-03") # Last day we have Lake O zone data
+
+cyan_data %>% 
+  # remove data prior to max_date
+  filter(date <= max_date) %>% 
+  
+  # Comment out the following once Kris corrects the data
+  rename(id = lake_id) %>% 
+  
+  # Calculate bloom/no bloom
+  mutate(bloom = ifelse(perc_ge_thresh>=0.1,1,0)) %>%
+  
+  # Set aside last time step for prediction
+  mutate(subset = ifelse(date == max_date,'prediction',NA)) %>%
+  
+  # Pre-process bloom data; start by removing missing bloom data for rows not in prediction set
+  filter(!is.na(subset) | (!is.na(bloom) & is.na(subset))) %>% 
+  
+  # Group by feature to make sure all sampling is even across lakes (or zones where applicable)
+  group_by(id) %>%
+  
+  # Assign subsets
+  mutate(
+    # Create a row number column for if/else statement
+    row = ifelse(is.na(subset), row_number(),NA),
+    # Use the rows to randomly sample the data
+    subset = ifelse(date == max_date,'prediction', # Keep the prediction data
+                    ifelse(row %in% sample(
+                      x = max(row, na.rm = T), 
+                      size = floor(0.7 * max(row, na.rm = T))
+                    ),
+                    # Assign 70% to training
+                    'training',
+                    # Remaining data is reserved as validation data
+                    'validation')),
+    subset = factor(subset)) %>% 
+  
+  # Ungroup data
+  ungroup() %>% 
+  
+  # Order data
+  arrange(id,date) %>% 
+  
+  # Go ahead and prep input col (NA's for val and pred datasets)
+  mutate(bloom_input = ifelse(subset != "training", NA, bloom)) %>%
+  
+  # Join with other datasets
+  left_join(static_data_prepped) %>%
+  
+  # Remove unused columns
+  dplyr::select(id,date,cyclic_date,perc_ge_thresh,bloom,bloom_input,subset,colnames(static_data_prepped)) -> cyan_data_prepped
+
+#Join MRMS data
+cyan_data_prepped <- left_join(cyan_data_prepped,mrms_compiled) %>% left_join(rtma_compiled)
+
+# Attach spatial data - make this a separate obj because tibbles are sometimes easier to work with 
+fl_lz %>% 
+  st_centroid() %>% 
+  dplyr::select(id,name,type,geometry) %>%
+  full_join(cyan_data_prepped) %>%
+  arrange(id,date) %>% as_Spatial() -> cyan_data_point
+
+# Construct latent model components ----
+spde <- inla.spde2.matern(mesh)
+
+hyprior <- list(theta1 = list(prior="pc.prec", param=c(0.5, 0.05)),
+                theta2 = list(prior="pc.cor1", param=c(0.1, 0.9)))
+
+#Selected model formulation is  14e. ----
+
+formula_14e <- bloom_input ~ 
+  total_area_km2 + 
+  depth_hyd_m + 
+  geo_mean_color + 
+  geo_mean_alk + 
+  avg_precip_annual + 
+  avg_temp_annual +   
+  precip_huc12_28Day +
+  temperature_huc12_28day +
+  pressure_huc12_7day +
+  cloud_cover_huc12_7day +
+  wind_speed_huc12_7day +
+  wind_direction_huc12_7day +
+  s(geometry,model = spde) + t(yday(date), model = "ar1",hyper = hyprior, constr = T) + Intercept(1)
+
+fit_14e <- bru(formula_14e, 
+               data = cyan_data_point, # Must be the shapefile version of our data
+               family = "binomial",
+               control.family = list(link = 'logit'),
+               options = bru_options(control.predictor = list(compute = T,
+                                                              link = 1),
+                                     control.inla = list(int.strategy = "eb"),
+                                     control.compute = list(dic = T,cpo = T,config = T))
+)
+
+summary(fit_14e)
+
+predictions_14e <- predict(fit_14e, 
+                           cyan_data_point[which(cyan_data_point$subset == 'prediction'),],
+                           ~ exp(
+                             total_area_km2 + 
+                               depth_hyd_m + 
+                               geo_mean_color + 
+                               geo_mean_alk + 
+                               avg_precip_annual + 
+                               avg_temp_annual +   
+                               precip_huc12_28Day +
+                               temperature_huc12_28day +
+                               pressure_huc12_7day +
+                               cloud_cover_huc12_7day +
+                               wind_speed_huc12_7day +
+                               wind_direction_huc12_7day +
+                               s + t + Intercept
+                           )/(1 + exp(total_area_km2 + 
+                                        depth_hyd_m + 
+                                        geo_mean_color + 
+                                        geo_mean_alk + 
+                                        avg_precip_annual + 
+                                        avg_temp_annual +   
+                                        precip_huc12_28Day +
+                                        temperature_huc12_28day +
+                                        pressure_huc12_7day +
+                                        cloud_cover_huc12_7day +
+                                        wind_speed_huc12_7day +
+                                        wind_direction_huc12_7day +
+                                        s + t + Intercept)), # converts log-odds to prob,
+                           n.samples = 500,
+                           seed = 1234)
+
+#Define subsets for training/validation
+# Pull subsets - should be the same across all models
+training_subset <- which(cyan_data_prepped$subset == "training")
+validation_subset <- which(cyan_data_prepped$subset == "validation")
+prediction_subset <- which(cyan_data_prepped$subset == "prediction")
+
+# Pull observations
+training_observations <- cyan_data_prepped$bloom[training_subset]
+validation_observations <- cyan_data_prepped$bloom[validation_subset]
+prediction_observations <- cyan_data_prepped$bloom[prediction_subset]
+
+calculate_performance_stats('fit_14e')
+
+predictions_14e %>%
+  as_tibble() %>%
+  select(id,name,type,date,perc_ge_thresh, bloom, mean) %>%
+  rename(bloom_prob = mean) %>%
+  mutate(bloom_pred = ifelse(bloom_prob >= cutoff_14e[3], 1, 0)) -> predictions_output
+
+predictions_output %>%
+  left_join(static_data_prepped) %>%
+  select(id,wbid,name,type,date,bloom_prob,bloom_pred) -> predictions_output
+
+print(predictions_output)
+
+write_csv(predictions_output, "prediction.csv")
